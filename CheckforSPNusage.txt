@@ -1,0 +1,84 @@
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory=$true)] [string]$ServerA,          # e.g. "WSUS-01"
+  [Parameter(Mandatory=$true)] [string]$ServerB,          # e.g. "APP-01"
+  [int]$HoursBack = 12,
+  [string]$OutCsv  = "$PWD\KRB_4769_Compare_$($ServerA -replace '[^A-Za-z0-9_-]','_')_vs_$($ServerB -replace '[^A-Za-z0-9_-]','_').csv"
+)
+ 
+function Decode-TicketOptions([int]$Options){
+  $flags = [ordered]@{
+    0x00000002='Forwardable'; 0x00000004='Forwarded';     0x00000008='Proxiable'
+    0x00000010='Proxy';       0x00000020='AllowPostdate'; 0x00000040='Postdated'
+    0x00000080='Invalid';     0x00000100='Renewable';     0x00000200='Initial'
+    0x00000400='Pre-Auth';    0x00000800='HW-Auth';       0x00001000='TransitedPolicyChecked'
+    0x00002000='OKAsDelegate';0x00004000='Anonymous';     0x00008000='EncPARep'
+  }
+  $present = @{}
+  foreach($k in $flags.Keys){ $present[$flags[$k]] = [bool]($Options -band $k) }
+  return $present
+}
+ 
+function Get-4769ForServer {
+  param([string]$Server,[datetime]$Since)
+  $regex = "(?i)/(?:$([Regex]::Escape($Server)))(\.|/|$)"
+  $rows  = @()
+  Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4769; StartTime=$Since } -ErrorAction SilentlyContinue |
+    ForEach-Object {
+      $x=[xml]$_.ToXml()
+      $d=@{}; foreach($n in $x.Event.EventData.Data){ $d[$n.Name]=$n.'#text' }
+      $svc=$d['ServiceName']; if (-not $svc -or ($svc -notmatch $regex)) { return }
+      $hex = $d['TicketOptions']; if (-not $hex) { $hex='0x0' }
+      $opt = [int]("0x{0}" -f ($hex -replace '^0x',''))
+      $dec = Decode-TicketOptions $opt
+      $rows += [pscustomobject]@{
+        ServerTarget     = $Server
+        TimeCreated      = $_.TimeCreated
+        ServiceName      = $svc
+        ClientAccount    = $d['AccountName']
+        ClientAddress    = $d['ClientAddress']
+        TicketOptionsHex = ('0x{0:X8}' -f $opt)
+        Forwardable      = $dec['Forwardable']
+        OKAsDelegate     = $dec['OKAsDelegate']
+        Renewable        = $dec['Renewable']
+        Initial          = $dec['Initial']
+        PreAuth          = $dec['Pre-Auth']
+        HWAuth           = $dec['HW-Auth']
+        Proxiable        = $dec['Proxiable']
+        Proxy            = $dec['Proxy']
+        TransitedPolicyChecked = $dec['TransitedPolicyChecked']
+        EncPARep         = $dec['EncPARep']
+      }
+    }
+  return $rows
+}
+ 
+$since = (Get-Date).AddHours(-$HoursBack)
+ 
+$rowsA = Get-4769ForServer -Server $ServerA -Since $since
+$rowsB = Get-4769ForServer -Server $ServerB -Since $since
+ 
+if (-not $rowsA -and -not $rowsB) {
+  Write-Warning "No 4769 events for '$ServerA' or '$ServerB' in the last $HoursBack hour(s). Ensure auditing is enabled and a Kerberos access hit both servers."
+  return
+}
+ 
+# Add a simple result classification
+$all = @($rowsA + $rowsB) | ForEach-Object {
+  $result = if (-not $_.Forwardable -and -not $_.OKAsDelegate) { 'DelegationBlocked' }
+            elseif ($_.Forwardable -and -not $_.OKAsDelegate)   { 'ForwardableOnly' }
+            elseif ($_.Forwardable -and $_.OKAsDelegate)        { 'TrustedForDelegation' }
+            else                                                { 'Other' }
+  $_ | Add-Member -NotePropertyName Result -NotePropertyValue $result -PassThru
+}
+ 
+$all | Sort-Object ServerTarget, TimeCreated -Descending |
+  Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+ 
+"CSV: $OutCsv"
+ 
+"---- Summary by ServerTarget, SPN and Flags ----"
+$all | Group-Object { "{0} | {1} | FWD={2} OKAsDel={3}" -f $_.ServerTarget,$_.ServiceName,$_.Forwardable,$_.OKAsDelegate } |
+  Sort-Object Count -Descending |
+  Select-Object Count, Name |
+  Format-Table -Auto
